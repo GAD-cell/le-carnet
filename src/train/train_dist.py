@@ -152,7 +152,7 @@ def train(
     autocast_ctx,
 ):
     """
-    Train the model on a single GPU.
+    Train the model on a multi GPU.
     """
     # Load checkpoint if exists
     if config.load_checkpoint and os.path.exists(config.load_checkpoint_path):
@@ -338,16 +338,16 @@ def main(args):
     optimizer = MuonClip(model, config_opt, muon_config)
     #optimizer = AdamW(model.parameters(), lr=train_config.learning_rate)
 
-    config = {
-    "train_micro_batch_size_per_gpu": 1,
-    "gradient_accumulation_steps": 1,
+    deepspeed_config = {
+    "train_micro_batch_size_per_gpu": train_config.train_batch_size,
+    "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
 
     "scheduler": {
-        "type": "WarmupLR",
+        "type": "WarmupDecayLR",
         "params": {
         "warmup_min_lr": 0,
-        "warmup_max_lr": 5e-5,
-        "warmup_num_steps": 1000
+        "warmup_max_lr": train_config.learning_rate,
+        "warmup_num_steps": train_config.num_warmup_steps,
         }
     },
     "fp16": {
@@ -359,7 +359,7 @@ def main(args):
     model, optimizer, _, _ = deepspeed.initialize(
         model=model,
         optimizer=optimizer,
-        config=config
+        config=deepspeed_config
     )
     
     lr_scheduler = model.lr_scheduler
