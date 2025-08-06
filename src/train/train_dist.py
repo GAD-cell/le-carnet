@@ -327,7 +327,7 @@ def main(args):
     optimizer = MuonClip(model, config_opt, muon_config)
 
 
-    world_size = os.get.env("WORLD_SIZE",0)
+    world_size = os.environ.get("WORLD_SIZE",0)
     train_micro_batch_size_per_gpu = train_config.train_batch_size//(train_config.gradient_accumulation_steps*world_size)
     # DeepSpeed configuration
     deepspeed_config = {
