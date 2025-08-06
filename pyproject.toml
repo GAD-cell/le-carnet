@@ -18,7 +18,8 @@ dependencies = [
   "accelerate==1.5.1",
   "mistralai==1.7.0",
   "jsonlines==4.0.0",
-  "wandb==0.19.11"
+  "wandb==0.19.11",
+  "deepspeed==0.17.4"
 ]
 
 [tool.uv]

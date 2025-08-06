@@ -29,6 +29,8 @@ from configs import (
     ModelConfig_21M,
 )
 
+import deepspeed
+import torch.distributed as dist
 
 MODEL_CONFIG_CLASSES = {
     "custom": CustomConfig,
@@ -110,13 +112,13 @@ def compute_batch_loss(model, batch, loss_fn, device, autocast_ctx):
     """
     Compute the loss for a batch of data.
     """
-    with autocast_ctx:
-        input_ids = batch["input_ids"].to(device)
-        labels = batch["labels"].to(device)
-        attention_mask = batch["attention_mask"].to(device)
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-        logits = outputs.logits
-        loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
+
+    input_ids = batch["input_ids"].to(device)
+    labels = batch["labels"].to(device)
+    attention_mask = batch["attention_mask"].to(device)
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    logits = outputs.logits
+    loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
 
     return loss
 
@@ -328,19 +330,39 @@ def main(args):
     # Define Loss, Optimizer and scheduler
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     import sys
-    #sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "muon", "src")))
+    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "muon", "src")))
     from muon_clip import MuonClip, MuonConfig
     from transformers import AutoConfig
     config_opt = AutoConfig.from_pretrained("MaxLSB/LeCarnet-3M")
     muon_config = MuonConfig()
     optimizer = MuonClip(model, config_opt, muon_config)
     #optimizer = AdamW(model.parameters(), lr=train_config.learning_rate)
-    lr_scheduler = get_scheduler(
-        name="linear",
+
+    config = {
+    "train_micro_batch_size_per_gpu": 1,
+    "gradient_accumulation_steps": 1,
+
+    "scheduler": {
+        "type": "WarmupLR",
+        "params": {
+        "warmup_min_lr": 0,
+        "warmup_max_lr": 5e-5,
+        "warmup_num_steps": 1000
+        }
+    },
+    "fp16": {
+        "enabled": train_config.mixed_precision,
+        "auto_cast": train_config.mixed_precision,
+    }
+    }
+
+    model, optimizer, _, _ = deepspeed.initialize(
+        model=model,
         optimizer=optimizer,
-        num_warmup_steps=train_config.num_warmup_steps,
-        num_training_steps=train_config.total_iterations,
+        config=config
     )
+    
+    lr_scheduler = model.lr_scheduler
 
     # Get AMP scaler and autocast context for mixed precision training
     scaler, autocast_ctx = get_amp_scaler_and_autocast(
@@ -363,6 +385,7 @@ def main(args):
     )
 
     wandb.finish()
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
@@ -376,5 +399,6 @@ if __name__ == "__main__":
         default="3M",
         help="Size of the model to train.",
     )
+    parser.add_argument('--local_rank', type=int, default=0, help='Used for distributed training')
     args = parser.parse_args()
     main(args)
