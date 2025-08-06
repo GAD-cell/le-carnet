@@ -323,7 +323,7 @@ def main(args):
     from transformers import AutoConfig
     
     config_opt = AutoConfig.from_pretrained("MaxLSB/LeCarnet-3M")
-    muon_config = MuonConfig()
+    muon_config = MuonConfig(enable_clipping=False)
     optimizer = MuonClip(model, config_opt, muon_config)
 
 
