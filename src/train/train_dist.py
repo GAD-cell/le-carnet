@@ -176,6 +176,7 @@ def train(
     for epoch in range(start_epoch, config.num_epochs):
         for step, batch in enumerate(train_dataloader, start=1):
             # DeepSpeed handles the forward/backward pass
+            batch = {k: v.to(model_engine.local_rank) for k, v in batch.items()}
             loss = model_engine(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
@@ -343,7 +344,7 @@ def main(args):
             "auto_cast": train_config.mixed_precision,
         },
         "zero_optimization": {
-            "stage": 1,  # Start with stage 1, can increase if needed
+            "stage": 0, #handle zero optimization stage manually
         }
     }
 
