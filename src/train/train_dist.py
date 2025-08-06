@@ -318,9 +318,7 @@ def main(args):
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     
     # Import MuonClip optimizer
-    import sys
-    sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "muon", "src")))
-    from muon_clip import MuonClip, MuonConfig
+    from muon import MuonClip, MuonConfig
     from transformers import AutoConfig
     
     config_opt = AutoConfig.from_pretrained("MaxLSB/LeCarnet-3M")
