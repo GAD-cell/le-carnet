@@ -39,6 +39,9 @@ PROMPT ?= Il était une fois
 EVAL_MODEL ?= MaxLSB/LeCarnet-3M
 JUDGE_MODEL ?= mistral-large-2411
 
+# Visible gpu
+CUDA_VISIBLE_DEVICES ?= 0
+
 .PHONY: env generate-mistral generate-openai push-dataset train train-dist inference eval push-model
 
 env:
@@ -72,7 +75,7 @@ train:
 		--model_config $(MODEL_CONFIG)
 
 train-dist:
-	@deepspeed $(TRAIN_DIST_SCRIPT) \
+	@CUDA_VISIBLE_DEVICES=$(CUDA_VISIBLE_DEVICES) deepspeed $(TRAIN_DIST_SCRIPT) \
 		--model_config $(MODEL_CONFIG) \
 
 inference:
