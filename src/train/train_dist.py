@@ -40,6 +40,14 @@ MODEL_CONFIG_CLASSES = {
 }
 
 
+def setup_distributed():
+    """Initialize distributed training if not already done by DeepSpeed"""
+    if not dist.is_initialized():
+        # DeepSpeed handles this automatically, but just in case
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        torch.cuda.set_device(local_rank)
+
+
 class Tokenizer:
     """
     Tokenizer class to handle tokenization and padding.
@@ -108,22 +116,21 @@ def get_llama_config(config, tokenizer) -> LlamaConfig:
     )
 
 
-def compute_batch_loss(model, batch, loss_fn, device, autocast_ctx):
+def compute_batch_loss(model, batch, loss_fn):
     """
-    Compute the loss for a batch of data.
+    Compute the loss for a batch of data with DeepSpeed.
     """
-
-    input_ids = batch["input_ids"].to(device)
-    labels = batch["labels"].to(device)
-    attention_mask = batch["attention_mask"].to(device)
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    # DeepSpeed handles device placement automatically
+    outputs = model(
+        input_ids=batch["input_ids"], 
+        attention_mask=batch["attention_mask"]
+    )
     logits = outputs.logits
-    loss = loss_fn(logits.view(-1, logits.size(-1)), labels.view(-1))
-
+    loss = loss_fn(logits.view(-1, logits.size(-1)), batch["labels"].view(-1))
     return loss
 
 
-def evaluate(model, loss_fn, val_dataloader, device, autocast_ctx):
+def evaluate(model, loss_fn, val_dataloader):
     """
     Evaluate the model on the validation set.
     """
@@ -131,7 +138,7 @@ def evaluate(model, loss_fn, val_dataloader, device, autocast_ctx):
     total_loss = 0
     with torch.no_grad():
         for batch in val_dataloader:
-            loss = compute_batch_loss(model, batch, loss_fn, device, autocast_ctx)
+            loss = compute_batch_loss(model, batch, loss_fn)
             total_loss += loss.item()
     avg_loss = total_loss / len(val_dataloader)
     perplexity = torch.exp(torch.tensor(avg_loss))
@@ -141,124 +148,100 @@ def evaluate(model, loss_fn, val_dataloader, device, autocast_ctx):
 
 def train(
     config,
-    model,
+    model_engine,  # DeepSpeed engine
     tokenizer,
     loss_fn,
     train_dataloader,
     val_dataloader,
-    optimizer,
-    lr_scheduler,
-    scaler,
-    autocast_ctx,
 ):
     """
-    Train the model on a multi GPU.
+    Train the model with DeepSpeed.
     """
-    # Load checkpoint if exists
+    # Load checkpoint if exists (DeepSpeed way)
     if config.load_checkpoint and os.path.exists(config.load_checkpoint_path):
         tqdm.write(f"Loading checkpoint from {config.load_checkpoint_path}")
-        checkpoint = torch.load(config.load_checkpoint_path, map_location=config.device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
-        if scaler is not None:
-            scaler.load_state_dict(checkpoint["scaler_state_dict"])
-        start_epoch = checkpoint["epoch"] + 1
-        effective_steps = checkpoint["effective_steps"]
-        best_val_loss = checkpoint["best_val_loss"]
-        tqdm.write(
-            f"Checkpoint loaded! Resuming from epoch {start_epoch}, effective_steps {effective_steps}"
-        )
+        _, client_state = model_engine.load_checkpoint(config.load_checkpoint_path)
+        start_epoch = client_state.get('epoch', 0)
+        effective_steps = client_state.get('effective_steps', 0)
+        best_val_loss = client_state.get('best_val_loss', float("inf"))
+        tqdm.write(f"Checkpoint loaded! Resuming from epoch {start_epoch}")
     else:
         start_epoch = 0
         effective_steps = 0
         best_val_loss = float("inf")
 
-    gradient_accumulation_steps = config.gradient_accumulation_steps
     start_context = "Il était une fois"
     pbar = tqdm(total=config.total_iterations, initial=effective_steps, desc="Training")
-    model.train()
 
     for epoch in range(start_epoch, config.num_epochs):
         for step, batch in enumerate(train_dataloader, start=1):
-            loss = compute_batch_loss(
-                model, batch, loss_fn, config.device, autocast_ctx
-            )
-            loss = loss / gradient_accumulation_steps
+            # DeepSpeed handles the forward/backward pass
+            loss = model_engine(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                labels=batch["labels"]
+            ).loss
+
+            # DeepSpeed backward
+            model_engine.backward(loss)
             
-            if scaler is not None:
-                scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            # DeepSpeed step (includes gradient accumulation)
+            model_engine.step()
+
+            effective_steps += 1
+            pbar.update(1)
 
             if step % 100 == 0:
                 tqdm.write(
-                    f"step {effective_steps} | loss/train: {loss.item() * gradient_accumulation_steps:.4f} | lr: {optimizer.param_groups[0]['lr']:.6f}"
+                    f"step {effective_steps} | loss/train: {loss.item():.4f} | lr: {model_engine.get_lr()[0]:.6f}"
                 )
 
-            if step % gradient_accumulation_steps == 0:
-                if scaler is not None:
-                    scaler.unscale_(optimizer)
+            # Log to wandb (only on rank 0)
+            if model_engine.local_rank == 0:
+                wandb.log({
+                    "train_loss": loss.item(),
+                    "learning_rate": model_engine.get_lr()[0],
+                })
 
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if (step % config.eval_steps) == 0:
+                val_loss, perplexity = evaluate(model_engine, loss_fn, val_dataloader)
+                
+                if model_engine.local_rank == 0:
+                    tqdm.write(f"loss/val: {val_loss:.4f} | perplexity: {perplexity:.2f}")
+                    wandb.log({"val_loss": val_loss, "perplexity": perplexity})
 
-                if scaler is not None:
-                    scaler.step(optimizer)
-                    scaler.update()
-                else:
-                    optimizer.step()
+                    # Generate text for evaluation
+                    generated_text = generate_text(
+                        model_engine.module,  # Access the actual model
+                        tokenizer,
+                        start_context,
+                    )
+                    tqdm.write(f"Generated text: {generated_text}")
 
-                lr_scheduler.step()
-                optimizer.zero_grad()
-                effective_steps += 1
-                pbar.update(1)
-                wandb.log(
-                    {
-                        "train_loss": loss.item() * gradient_accumulation_steps,
-                        "learning_rate": optimizer.param_groups[0]["lr"],
-                    }
-                )
+                    # Save the best model
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        tqdm.write(f"New best validation loss: {best_val_loss:.4f}")
+                        os.makedirs(config.output_dir + "model_weights/", exist_ok=True)
+                        model_engine.save_pretrained(config.output_dir + "model_weights/")
+                        tokenizer.save_pretrained(config.output_dir + "model_weights/")
 
-            if (step % (config.eval_steps * gradient_accumulation_steps)) == 0:
-                val_loss, perplexity = evaluate(
-                    model, loss_fn, val_dataloader, config.device, autocast_ctx
-                )
-                tqdm.write(f"loss/val: {val_loss:.4f} | perplexity: {perplexity:.2f}")
-                wandb.log({"val_loss": val_loss, "perplexity": perplexity})
+            if effective_steps >= config.total_iterations:
+                break
 
-                # Generate text for evaluation
-                generated_text = generate_text(
-                    model,
-                    tokenizer,
-                    start_context,
-                )
-                tqdm.write(f"Generated text: {generated_text}")
+        # Save checkpoint at the end of each epoch (DeepSpeed way)
+        if model_engine.local_rank == 0:
+            client_state = {
+                'epoch': epoch,
+                'effective_steps': effective_steps,
+                'best_val_loss': best_val_loss,
+            }
+            checkpoint_dir = config.output_dir + f"checkpoints/checkpoint-epoch-{epoch}/"
+            model_engine.save_checkpoint(checkpoint_dir, client_state=client_state)
+            tqdm.write(f"Checkpoint saved at epoch {epoch}")
 
-                # Save the best model based on validation loss
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    tqdm.write(f"New best validation loss: {best_val_loss:.4f}")
-                    os.makedirs(config.output_dir + "model_weights/", exist_ok=True)
-                    model.save_pretrained(config.output_dir + "model_weights/")
-                    tokenizer.save_pretrained(config.output_dir + "model_weights/")
-
-        # Save checkpoint at the end of each epoch
-        checkpoint = {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "lr_scheduler_state_dict": lr_scheduler.state_dict(),
-            "scaler_state_dict": scaler.state_dict() if scaler is not None else None,
-            "epoch": epoch,
-            "effective_steps": effective_steps,
-            "best_val_loss": best_val_loss,
-        }
-        os.makedirs(config.output_dir + "checkpoints/", exist_ok=True)
-        torch.save(
-            checkpoint, config.output_dir + f"checkpoints/checkpoint-epoch-{epoch}.pt"
-        )
-        tqdm.write(
-            f"Checkpoint saved at epoch {epoch}, effective_steps {effective_steps}"
-        )
+        if effective_steps >= config.total_iterations:
+            break
 
     pbar.close()
     tqdm.write("Training complete.")
@@ -266,8 +249,11 @@ def train(
 
 def main(args):
     """
-    Main function to train the Llama model on a single GPU.
+    Main function to train the Llama model with DeepSpeed.
     """
+    # Setup distributed training
+    setup_distributed()
+    
     # Train config
     train_config = TrainConfig()
 
@@ -277,8 +263,10 @@ def main(args):
             "Please set the HF_TOKEN environment variable to your Hugging Face token."
         )
 
-    # Initialize wandb
-    wandb.init(project="LeCarnet", name="le-carnet-training-run")
+    # Initialize wandb only on rank 0
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    if local_rank == 0:
+        wandb.init(project="LeCarnet", name="le-carnet-training-run")
 
     tqdm.write("Loading dataset and tokenizer...")
     # Load dataset and tokenizer
@@ -287,16 +275,15 @@ def main(args):
     )
     tokenizer = Tokenizer(train_config.tokenizer_name).get_tokenizer()
 
-    # Display training information
-    tqdm.write(f"Using device: {train_config.device}")
-    tqdm.write(f"Config: {args.model_config}")
-    tqdm.write(f"Tokenizer: {train_config.tokenizer_name}")
-    tqdm.write(f"Output directory: {train_config.output_dir}")
-    tqdm.write(
-        f"Loaded {len(train_dataset)} training samples and {len(val_dataset)} validation samples"
-    )
-    if train_config.mixed_precision:
-        tqdm.write(f"Using mixed precision: {get_mixed_precision_dtype()}")
+    # Display training information (only on rank 0)
+    if local_rank == 0:
+        tqdm.write(f"Using device: cuda:{local_rank}")
+        tqdm.write(f"Config: {args.model_config}")
+        tqdm.write(f"Tokenizer: {train_config.tokenizer_name}")
+        tqdm.write(f"Output directory: {train_config.output_dir}")
+        tqdm.write(
+            f"Loaded {len(train_dataset)} training samples and {len(val_dataset)} validation samples"
+        )
 
     # Create dataloaders
     collate_fn = CollateFn(tokenizer, train_config.block_size)
@@ -316,9 +303,9 @@ def main(args):
         pin_memory=True,
     )
 
-    # Model
+    # Model (don't move to device, DeepSpeed will handle it)
     llama_config = get_llama_config(args.model_config, tokenizer)
-    model = LlamaForCausalLM(llama_config).to(train_config.device)
+    model = LlamaForCausalLM(llama_config)
 
     # Compute total iterations for num_epochs
     train_config.total_iterations = math.ceil(
@@ -327,70 +314,68 @@ def main(args):
         / train_config.gradient_accumulation_steps
     )
 
-    # Define Loss, Optimizer and scheduler
+    # Define Loss and Optimizer
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    
+    # Import MuonClip optimizer
     import sys
     sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "muon", "src")))
     from muon_clip import MuonClip, MuonConfig
     from transformers import AutoConfig
+    
     config_opt = AutoConfig.from_pretrained("MaxLSB/LeCarnet-3M")
     muon_config = MuonConfig()
     optimizer = MuonClip(model, config_opt, muon_config)
-    #optimizer = AdamW(model.parameters(), lr=train_config.learning_rate)
 
+    # DeepSpeed configuration
     deepspeed_config = {
-    "train_micro_batch_size_per_gpu": train_config.train_batch_size,
-    "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
-
-    "scheduler": {
-        "type": "WarmupDecayLR",
-        "params": {
-        "warmup_min_lr": 0,
-        "warmup_max_lr": train_config.learning_rate,
-        "warmup_num_steps": train_config.num_warmup_steps,
+        "train_micro_batch_size_per_gpu": train_config.train_batch_size,
+        "gradient_accumulation_steps": train_config.gradient_accumulation_steps,
+        "scheduler": {
+            "type": "WarmupDecayLR",
+            "params": {
+                "warmup_min_lr": 0,
+                "warmup_max_lr": train_config.learning_rate,
+                "warmup_num_steps": train_config.num_warmup_steps,
+                "total_num_steps": train_config.total_iterations,
+            }
+        },
+        "fp16": {
+            "enabled": train_config.mixed_precision,
+            "auto_cast": train_config.mixed_precision,
+        },
+        "zero_optimization": {
+            "stage": 1,  # Start with stage 1, can increase if needed
         }
-    },
-    "fp16": {
-        "enabled": train_config.mixed_precision,
-        "auto_cast": train_config.mixed_precision,
-    }
     }
 
-    model, optimizer, _, _ = deepspeed.initialize(
+    # Initialize DeepSpeed
+    model_engine, optimizer, _, _ = deepspeed.initialize(
         model=model,
         optimizer=optimizer,
         config=deepspeed_config
     )
+
+    if local_rank == 0:
+        tqdm.write(f"Training {num_parameters(model) / 1e6:.2f}M parameters")
+        tqdm.write("Starting training...")
     
-    lr_scheduler = model.lr_scheduler
-
-    # Get AMP scaler and autocast context for mixed precision training
-    scaler, autocast_ctx = get_amp_scaler_and_autocast(
-        train_config.device, train_config.mixed_precision
-    )
-
-    tqdm.write(f"Training {num_parameters(model) / 1e6:.2f}M parameters")
-    tqdm.write("Starting training...")
     train(
         train_config,
-        model,
+        model_engine,
         tokenizer,
         loss_fn,
         train_dataloader,
         val_dataloader,
-        optimizer,
-        lr_scheduler,
-        scaler,
-        autocast_ctx,
     )
 
-    wandb.finish()
-    dist.destroy_process_group()
+    if local_rank == 0:
+        wandb.finish()
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train a Llama-based model on a single GPU using LeCarnet dataset."
+        description="Train a Llama-based model with DeepSpeed."
     )
     parser.add_argument(
         "--model_config",
