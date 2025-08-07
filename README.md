@@ -47,7 +47,9 @@ The training pipeline supports Weights & Biases (WandB) for tracking training an
 
 | Task        | Make Command       | Equivalent CLI Command                                                                                                                                               | Default Values                                                                 |
 |-------------|--------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------|
-| Training    | `make train`       | `python src/train/train.py --model_config MODEL_CONFIG`                                                                                 | `MODEL_CONFIG=3M`                              |
+| Training    | `make train`       | `python src/train/train.py --model_config MODEL_CONFIG`       |                     `MODEL_CONFIG=3M`  | 
+| Distributed training | `make train-dist` |  `python src/train/train_dist.py --model_config MODEL_CONFIG` | 
+`MODEL_CONFIG=3M`,`CUDA_VISIBLE_DEVICES=0`                              |
 | Push Model to HF   | `make push-model`   | `python src/inference/push-model.py --repo_name HF_REPO --model_dir MODEL_DIR`                                              | `HF_REPO=MaxLSB/LeCarnet-3M`, `MODEL_DIR=LeCarnet-3M/model_weights/` |
 
 ⚠️ Check `src/train/configs.py` for fine-grained hyperparameter tuning. `MODEL_CONFIG=custom` to use your own custom model config.

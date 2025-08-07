@@ -49,7 +49,6 @@ env:
 		echo "Installing uv..."; \
 		curl -LsSf https://astral.sh/uv/install.sh | sh; \
 	}
-	@uv pip install git+https://github.com/GAD-cell/muon-clip.git@dist_muon
 	@echo "Setting up environment..."
 	@uv sync --python $(PYTHON_VERSION)
 	@echo "Environment ready."

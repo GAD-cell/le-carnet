@@ -31,6 +31,7 @@ from configs import (
 
 import deepspeed
 import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 
 MODEL_CONFIG_CLASSES = {
     "custom": CustomConfig,
@@ -44,6 +45,7 @@ def setup_distributed():
     """Initialize distributed training if not already done by DeepSpeed"""
     if not dist.is_initialized():
         # DeepSpeed handles this automatically, but just in case
+        dist.init_process_group(backend="nccl")
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
         torch.cuda.set_device(local_rank)
 
@@ -155,7 +157,7 @@ def train(
     val_dataloader,
 ):
     """
-    Train the model with DeepSpeed.
+    Train the model with DeepSpeed and support DistributedSampler.
     """
     # Load checkpoint if exists (DeepSpeed way)
     if config.load_checkpoint and os.path.exists(config.load_checkpoint_path):
@@ -174,19 +176,21 @@ def train(
     pbar = tqdm(total=config.total_iterations, initial=effective_steps, desc="Training")
 
     for epoch in range(start_epoch, config.num_epochs):
+        # 👇 Necessary for DistributedSampler
+        if hasattr(train_dataloader.sampler, 'set_epoch'):
+            train_dataloader.sampler.set_epoch(epoch)
+
         for step, batch in enumerate(train_dataloader, start=1):
-            # DeepSpeed handles the forward/backward pass
-            batch = {k: v.to(model_engine.local_rank) for k, v in batch.items()}
+            # Move batch to correct device
+            batch = {k: v.to(model_engine.device) for k, v in batch.items()}
+
             loss = model_engine(
                 input_ids=batch["input_ids"],
                 attention_mask=batch["attention_mask"],
                 labels=batch["labels"]
             ).loss
 
-            # DeepSpeed backward
             model_engine.backward(loss)
-            
-            # DeepSpeed step (includes gradient accumulation)
             model_engine.step()
 
             effective_steps += 1
@@ -197,7 +201,7 @@ def train(
                     f"step {effective_steps} | loss/train: {loss.item():.4f} | lr: {model_engine.get_lr()[0]:.6f}"
                 )
 
-            # Log to wandb (only on rank 0)
+            # Only log on rank 0
             if model_engine.local_rank == 0:
                 wandb.log({
                     "train_loss": loss.item(),
@@ -211,9 +215,8 @@ def train(
                     tqdm.write(f"loss/val: {val_loss:.4f} | perplexity: {perplexity:.2f}")
                     wandb.log({"val_loss": val_loss, "perplexity": perplexity})
 
-                    # Generate text for evaluation
                     generated_text = generate_text(
-                        model_engine.module,  # Access the actual model
+                        model_engine.module,  # Unwrap model from DeepSpeed
                         tokenizer,
                         start_context,
                     )
@@ -230,7 +233,7 @@ def train(
             if effective_steps >= config.total_iterations:
                 break
 
-        # Save checkpoint at the end of each epoch (DeepSpeed way)
+        # Save DeepSpeed checkpoint
         if model_engine.local_rank == 0:
             client_state = {
                 'epoch': epoch,
@@ -246,6 +249,7 @@ def train(
 
     pbar.close()
     tqdm.write("Training complete.")
+
 
 
 def main(args):
@@ -286,7 +290,10 @@ def main(args):
             f"Loaded {len(train_dataset)} training samples and {len(val_dataset)} validation samples"
         )
 
-    # Create dataloaders
+    # for distibuted data
+    train_sampler = DistributedSampler(train_dataset)
+    val_sampler = DistributedSampler(val_dataset, shuffle=False)
+
     collate_fn = CollateFn(tokenizer, train_config.block_size)
     train_dataloader = DataLoader(
         train_dataset,
@@ -318,14 +325,15 @@ def main(args):
     # Define Loss and Optimizer
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     
-    # Import MuonClip optimizer
-    from muon import MuonClip, MuonConfig
-    from transformers import AutoConfig
+    # To use muon-clip optimizer install with : uv pip install git+https://github.com/GAD-cell/muon-clip.git@main
+    #from muon import MuonClip, MuonConfig
+    #from transformers import AutoConfig
+    #config_opt = AutoConfig.from_pretrained("MaxLSB/LeCarnet-3M")
+    #muon_config = MuonConfig(enable_clipping=True)
+    #optimizer = MuonClip(model, config_opt, muon_config)
     
-    config_opt = AutoConfig.from_pretrained("MaxLSB/LeCarnet-3M")
-    muon_config = MuonConfig(enable_clipping=False)
-    optimizer = MuonClip(model, config_opt, muon_config)
-
+    
+    optimizer = AdamW(model.parameters(), lr=train_config.learning_rate)
 
     world_size = int(os.environ.get("WORLD_SIZE",0))
     train_micro_batch_size_per_gpu = train_config.train_batch_size//(train_config.gradient_accumulation_steps*world_size)
@@ -346,9 +354,7 @@ def main(args):
             "enabled": train_config.mixed_precision,
             "auto_cast": train_config.mixed_precision,
         },
-        "zero_optimization": {
-            "stage": 0, #handle zero optimization stage manually
-        }
+        #Note: zero stage optimization from deepspeed is not compatible with muon implementation.
     }
 
     # Initialize DeepSpeed
