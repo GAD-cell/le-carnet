@@ -183,7 +183,7 @@ def train(
                 model, batch, loss_fn, config.device, autocast_ctx
             )
             loss = loss / gradient_accumulation_steps
-
+            
             if scaler is not None:
                 scaler.scale(loss).backward()
             else:
@@ -327,7 +327,17 @@ def main(args):
 
     # Define Loss, Optimizer and scheduler
     loss_fn = torch.nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
+    import sys
+
+    # To use muon-clip optimizer install with : uv pip install git+https://github.com/GAD-cell/muon-clip.git@main
+    #from muon import MuonClip, MuonConfig
+    #from transformers import AutoConfig
+    #config_opt = AutoConfig.from_pretrained("MaxLSB/LeCarnet-3M")
+    #muon_config = MuonConfig()
+    #optimizer = MuonClip(model, config_opt, muon_config)
+     
     optimizer = AdamW(model.parameters(), lr=train_config.learning_rate)
+    
     lr_scheduler = get_scheduler(
         name="linear",
         optimizer=optimizer,

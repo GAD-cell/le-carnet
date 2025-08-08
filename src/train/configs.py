@@ -9,16 +9,16 @@ class TrainConfig:
     output_dir: str = "LeCarnet-3M/"
     load_checkpoint_path: str = "LeCarnet-3M/checkpoints/checkpoint-epoch-0.pt"
     load_checkpoint: bool = False
-    mixed_precision: bool = True
+    mixed_precision: bool = False
     cache_dir: str = "cache/"
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    eval_steps: int = 5000
+    eval_steps: int = 50000
     gradient_accumulation_steps: int = 2
     train_batch_size: int = 16
     eval_batch_size: int = 16
     learning_rate: float = 5e-4
-    num_warmup_steps: int = 5000
-    num_epochs: int = 10
+    num_warmup_steps: int = 100
+    num_epochs: int = 1
     block_size: int = 512
     num_workers: int = 4
 

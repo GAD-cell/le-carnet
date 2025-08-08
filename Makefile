@@ -5,6 +5,7 @@ MISTRAL_SCRIPT       := src/data/mistral.py
 OPENAI_SCRIPT        := src/data/openai.py
 PUSH_DATASET_SCRIPT  := src/data/push_dataset.py
 TRAIN_SCRIPT         := src/train/train.py
+TRAIN_DIST_SCRIPT    := src/train/train_dist.py
 INFERENCE_SCRIPT     := src/inference/inference.py
 PUSH_MODEL_SCRIPT    := src/train/push_model.py
 EVAL_SCRIPT          := src/eval/eval.py
@@ -38,7 +39,10 @@ PROMPT ?= Il était une fois
 EVAL_MODEL ?= MaxLSB/LeCarnet-3M
 JUDGE_MODEL ?= mistral-large-2411
 
-.PHONY: env generate-mistral generate-openai push-dataset train inference eval push-model
+# Visible gpu
+CUDA_VISIBLE_DEVICES ?= 0
+
+.PHONY: env generate-mistral generate-openai push-dataset train train-dist inference eval push-model
 
 env:
 	@command -v uv >/dev/null 2>&1 || { \
@@ -68,6 +72,10 @@ push-dataset:
 train:
 	$(PYTHON) $(TRAIN_SCRIPT) \
 		--model_config $(MODEL_CONFIG)
+
+train-dist:
+	@CUDA_VISIBLE_DEVICES=$(CUDA_VISIBLE_DEVICES) deepspeed $(TRAIN_DIST_SCRIPT) \
+		--model_config $(MODEL_CONFIG) \
 
 inference:
 	$(PYTHON) $(INFERENCE_SCRIPT) \
